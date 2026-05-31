@@ -417,9 +417,11 @@ pub struct HeapCache {
 
     /// heapcache.py: oldbox.set_replaced_with_const() in replace_box().
     ///
-    /// RPython stores this on the box's `_forwarded`; pyre stores the same
-    /// bit of heapcache-visible state in a per-op slot keyed by OpRef.
-    replaced_with_const: Vec<Option<OpRef>>,
+    /// RPython stores this on the box's `_forwarded`.  Pyre's `OpRef`
+    /// carries both a position and a typed Box identity, so the key must be
+    /// the full `OpRef`, not just `raw()`: `IntOp(n)` and `RefOp(n)` are
+    /// different boxes upstream.
+    replaced_with_const: Vec<(OpRef, OpRef)>,
 
     /// heapcache.py:176: need_guard_not_invalidated — set True on reset,
     /// consumed by quasi-immut field recording to decide whether to emit
@@ -463,8 +465,9 @@ impl HeapCache {
             return opref;
         }
         self.replaced_with_const
-            .get(opref.raw() as usize)
-            .and_then(|v| *v)
+            .iter()
+            .rev()
+            .find_map(|(old, new)| if *old == opref { Some(*new) } else { None })
             .unwrap_or(opref)
     }
 
@@ -997,11 +1000,15 @@ impl HeapCache {
     ///
     pub fn replace_box(&mut self, old: OpRef, new: OpRef) {
         if !old.is_constant() && new.is_constant() {
-            let i = old.raw() as usize;
-            if i >= self.replaced_with_const.len() {
-                self.replaced_with_const.resize(i + 1, None);
+            if let Some((_, existing)) = self
+                .replaced_with_const
+                .iter_mut()
+                .find(|(existing_old, _)| *existing_old == old)
+            {
+                *existing = new;
+            } else {
+                self.replaced_with_const.push((old, new));
             }
-            self.replaced_with_const[i] = Some(new);
         }
     }
 
@@ -1106,7 +1113,7 @@ impl HeapCache {
         if let Some(slot) = self.loopinvariant_result.as_mut() {
             forward(slot, visitor);
         }
-        for slot in self.replaced_with_const.iter_mut().flatten() {
+        for (_, slot) in self.replaced_with_const.iter_mut() {
             forward(slot, visitor);
         }
         for deps in self.heapc_deps.iter_mut().flatten() {
@@ -2073,12 +2080,9 @@ impl HeapCache {
         // history.py:644-668 FO_REPLACED_WITH_CONST is stored on the
         // FrontendOp's `position_and_flags` field, so RPython's flag
         // dies with the FrontendOp at trace teardown.  pyre's
-        // `replaced_with_const` Vec is keyed by OpRef.0 (a position
-        // index) and OpRef numbers are reused across traces, so we
-        // clear it at the same trace boundary that drops the
-        // FrontendOp objects in upstream.  Without this the next
-        // trace can pick up a stale substitution from the previous
-        // trace's `replace_box`.
+        // `replaced_with_const` is keyed by the full OpRef identity and OpRef
+        // numbers are reused across traces, so clear it at the same trace
+        // boundary that drops the FrontendOp objects in upstream.
         self.replaced_with_const.clear();
     }
 
@@ -2575,6 +2579,21 @@ mod tests {
         cache.replace_box(old, new);
 
         assert_eq!(cache.arraylen(old), Some(new));
+    }
+
+    #[test]
+    fn test_replace_box_keeps_typed_opref_identity() {
+        let mut cache = HeapCache::new();
+        let old_ref = OpRef::ref_op(5);
+        let same_raw_int = OpRef::int_op(5);
+        let new_ref = OpRef::const_ptr(GcRef(0));
+
+        cache.arraylen_now_known(old_ref, old_ref);
+        cache.arraylen_now_known(OpRef::ref_op(6), same_raw_int);
+        cache.replace_box(old_ref, new_ref);
+
+        assert_eq!(cache.arraylen(old_ref), Some(new_ref));
+        assert_eq!(cache.arraylen(OpRef::ref_op(6)), Some(same_raw_int));
     }
 
     #[test]
