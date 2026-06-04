@@ -3276,6 +3276,27 @@ pub extern "C" fn bh_build_list_fn(argc: i64, item0: i64, item1: i64, item2: i64
     pyre_interpreter::runtime_ops::build_list_from_refs(&items) as i64
 }
 
+/// BUILD_TUPLE: `space.newtuple([w_items])`. Allocation-only; the items are
+/// pre-existing heap refs, no user code runs.
+pub extern "C" fn bh_build_tuple_fn(argc: i64, item0: i64, item1: i64, item2: i64) -> i64 {
+    let n = argc as usize;
+    let items: Vec<pyre_object::PyObjectRef> = match n {
+        0 => vec![],
+        1 => vec![item0 as pyre_object::PyObjectRef],
+        2 => vec![
+            item0 as pyre_object::PyObjectRef,
+            item1 as pyre_object::PyObjectRef,
+        ],
+        3 => vec![
+            item0 as pyre_object::PyObjectRef,
+            item1 as pyre_object::PyObjectRef,
+            item2 as pyre_object::PyObjectRef,
+        ],
+        _ => panic!("unsupported argc {} in bh_build_tuple_fn", argc),
+    };
+    pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as i64
+}
+
 /// BUILD_SLICE: `space.newslice(w_start, w_end, w_step)`.
 /// `argc` is 2 or 3; for argc=2 the CPython/PyPy opcode semantics use None
 /// for `w_step` (`pypy/interpreter/pyopcode.py:1463-1472`).

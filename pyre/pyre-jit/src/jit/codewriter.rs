@@ -3084,6 +3084,25 @@ fn emit_frontend_newlist(
     )
 }
 
+fn emit_frontend_newtuple(
+    graph: &mut super::flow::FunctionGraph,
+    block: &super::flow::BlockRef,
+    items: Vec<super::flow::FlowValue>,
+    offset: i64,
+) -> super::flow::Variable {
+    // flowcontext.py BUILD_TUPLE -> `op.newtuple(*items).eval(self)`.
+    // Preserve the frontend semantic op in the graph; the build_tuple
+    // helper call remains a pyre backend adaptation only.
+    emit_graph_op_with_result(
+        graph,
+        block,
+        "newtuple",
+        items.into_iter().map(Into::into).collect(),
+        Kind::Ref,
+        offset,
+    )
+}
+
 fn emit_frontend_newslice(
     graph: &mut super::flow::FunctionGraph,
     block: &super::flow::BlockRef,
@@ -3633,6 +3652,7 @@ struct FnPtrIndices {
     load_const_fn: HelperHandle,
     store_subscr_fn: HelperHandle,
     build_list_fn: HelperHandle,
+    build_tuple_fn: HelperHandle,
     build_slice_fn: HelperHandle,
     normalize_raise_varargs_fn: HelperHandle,
     call_fn_0: HelperHandle,
@@ -3807,6 +3827,10 @@ fn register_helper_fn_pointers(
         cpu.set_current_exception_fn as *const (),
         CallFlavor::PlainCannotRaiseNoHeap,
     );
+    // `bh_build_tuple_fn` is allocation-only, same classification as
+    // `bh_build_list_fn` (allocation can `MemoryError`, no virtual-force).
+    // Bound after the existing fn_ptrs to preserve their indices.
+    let build_tuple_fn = bind(assembler, cpu.build_tuple_fn as *const (), CallFlavor::Plain);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3817,6 +3841,7 @@ fn register_helper_fn_pointers(
         load_const_fn,
         store_subscr_fn,
         build_list_fn,
+        build_tuple_fn,
         build_slice_fn,
         normalize_raise_varargs_fn,
         call_fn_0,
@@ -4556,6 +4581,11 @@ impl CodeWriter {
                 HelperHandle {
                     idx: build_list_fn_idx,
                     flavor: _build_list_fn_flavor,
+                },
+            build_tuple_fn:
+                HelperHandle {
+                    idx: build_tuple_fn_idx,
+                    flavor: _build_tuple_fn_flavor,
                 },
             build_slice_fn:
                 HelperHandle {
@@ -8621,13 +8651,51 @@ impl CodeWriter {
 
                         // BuildTuple(count): pops count items, pushes 1 tuple. Net: -(count-1).
                         Instruction::BuildTuple { count } => {
-                            let n = count.get(op_arg) as usize;
-                            for _ in 0..n {
-                                pop_and_decr_depth(&mut current_state, &mut current_depth);
+                            let argc = count.get(op_arg) as usize;
+                            if argc > 3 {
+                                for _ in 0..argc {
+                                    let _ = emit_popvalue_ref!(current_depth, py_pc);
+                                    let _ = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                }
+                                emit_abort_permanent!();
+                                push_fresh_ref(&mut current_state, &mut graph);
+                                current_depth += 1;
+                                emit_vsd!(current_depth, py_pc);
+                                continue;
                             }
-                            push_fresh_ref(&mut current_state, &mut graph);
-                            current_depth += 1;
-                            emit_abort_permanent!();
+                            let mut arg_regs_rev: Vec<u16> = Vec::with_capacity(argc);
+                            let mut item_values_rev = Vec::with_capacity(argc);
+                            for _ in 0..argc {
+                                let item_reg = emit_popvalue_ref!(current_depth, py_pc);
+                                let item_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_reg);
+                                }
+                                arg_regs_rev.push(item_reg);
+                                item_values_rev.push(item_value);
+                            }
+                            let arg_regs: Vec<u16> = arg_regs_rev.iter().rev().copied().collect();
+                            // build_tuple_fn(argc, item0, item1, item2) → tuple. Same
+                            // residual_call_ir_r shape as build_list_fn (the IR builder
+                            // is fn-index agnostic); unused item slots padded with
+                            // ConstInt(0).
+                            let result_value = emit_frontend_newtuple(
+                                &mut graph,
+                                &current_block.block(),
+                                item_values_rev.into_iter().rev().collect(),
+                                py_pc as i64,
+                            );
+                            pin!(Some(result_value), stack_base + current_depth);
+                            push_walker_emit(
+                                &current_block,
+                                super::flatten::build_build_list_fn_residual_call_ir_r_insn(
+                                    build_tuple_fn_idx,
+                                    argc,
+                                    &arg_regs,
+                                    stack_base + current_depth,
+                                ),
+                            );
+                            push_and_bump!(result_value.into(), py_pc);
                         }
 
                         // BuildSet(count): pops count items, pushes 1 set. Net: -(count-1).

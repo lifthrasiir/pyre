@@ -56,6 +56,8 @@ pub struct Cpu {
     pub store_subscr_fn: extern "C" fn(i64, i64, i64) -> i64,
     /// `bhimpl_build_list` — (argc, item0, item1, item2) → new list.
     pub build_list_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
+    /// `bhimpl_build_tuple` — (argc, item0, item1, item2) → new tuple.
+    pub build_tuple_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `bhimpl_build_slice` — (argc, start, stop, step) → new slice.
     pub build_slice_fn: extern "C" fn(i64, i64, i64, i64) -> i64,
     /// `RAISE_VARARGS` normalization helper used before `raise/r`.
@@ -150,6 +152,7 @@ impl Cpu {
             load_const_fn: crate::call_jit::bh_load_const_fn,
             store_subscr_fn: crate::call_jit::bh_store_subscr_fn,
             build_list_fn: crate::call_jit::bh_build_list_fn,
+            build_tuple_fn: crate::call_jit::bh_build_tuple_fn,
             build_slice_fn: crate::call_jit::bh_build_slice_fn,
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_with_frame,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
