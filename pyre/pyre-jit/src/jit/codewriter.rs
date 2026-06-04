@@ -3832,12 +3832,24 @@ fn register_helper_fn_pointers(
     // `bh_build_tuple_fn` is allocation-only, same classification as
     // `bh_build_list_fn` (allocation can `MemoryError`, no virtual-force).
     // Bound after the existing fn_ptrs to preserve their indices.
-    let build_tuple_fn = bind(assembler, cpu.build_tuple_fn as *const (), CallFlavor::Plain);
+    let build_tuple_fn = bind(
+        assembler,
+        cpu.build_tuple_fn as *const (),
+        CallFlavor::Plain,
+    );
     // `bh_unpack_sequence_fn` validates the length and allocates the item
     // tuple (can raise ValueError/TypeError); `bh_unpack_item_fn` indexes
     // that validated tuple. Both can raise → `CallFlavor::Plain`.
-    let unpack_sequence_fn = bind(assembler, cpu.unpack_sequence_fn as *const (), CallFlavor::Plain);
-    let unpack_item_fn = bind(assembler, cpu.unpack_item_fn as *const (), CallFlavor::Plain);
+    let unpack_sequence_fn = bind(
+        assembler,
+        cpu.unpack_sequence_fn as *const (),
+        CallFlavor::Plain,
+    );
+    let unpack_item_fn = bind(
+        assembler,
+        cpu.unpack_item_fn as *const (),
+        CallFlavor::Plain,
+    );
     FnPtrIndices {
         call_fn,
         load_global_fn,

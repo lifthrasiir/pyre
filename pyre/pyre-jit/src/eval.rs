@@ -8171,11 +8171,24 @@ mod tests {
         assert_eq!(state.symbolic_valuestackdepth(), 3);
         let nlocals = state.symbolic_nlocals();
         let stack_only = state.symbolic_valuestackdepth() - nlocals;
-        assert_eq!(state.symbolic_registers_r().len(), nlocals + stack_only);
+        // The closing `GuardFutureCondition` lazy-inits every register the
+        // jitcode reports live at `target_pc`. When that PC is a real
+        // result-producing op (BUILD_TUPLE / BINARY_OP / BUILD_LIST), its
+        // destination color sits one past the virtualizable window
+        // `[nlocals..nlocals+stack_only]`, so `registers_r` may extend
+        // beyond the window with a tail slot the synthetic state never
+        // produced (production fills it via `materialize_fail_arg_slot`).
+        // The invariant under test is that the window itself — the slots
+        // the JUMP carries — is fully covered and preserved.
         assert!(
-            state.symbolic_registers_r()[nlocals..]
+            state.symbolic_registers_r().len() >= nlocals + stack_only,
+            "register file must cover the virtualizable window"
+        );
+        assert!(
+            state.symbolic_registers_r()[nlocals..nlocals + stack_only]
                 .iter()
-                .all(|opref| !opref.is_none())
+                .all(|opref| !opref.is_none()),
+            "live stack slots carried by the JUMP must be preserved"
         );
     }
 
