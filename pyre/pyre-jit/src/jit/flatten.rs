@@ -3634,6 +3634,38 @@ fn build_residual_call_ir_r_insn_from_int_only_operands(
     )
 }
 
+/// `(Int, Ref) → Ref` helper shape — one leading Int scalar arg and one
+/// Ref arg, both passed through `residual_call_ir_r` (Int args first, then
+/// Ref args, matching the `build_list` ABI ordering). Used by
+/// UNPACK_SEQUENCE: `unpack_sequence_fn(count, seq)` and
+/// `unpack_item_fn(index, tuple)`.
+pub fn build_one_int_one_ref_fn_residual_call_ir_r_insn(
+    fn_idx: u16,
+    int_val: i64,
+    ref_reg: u16,
+    dst_reg: u16,
+) -> Insn {
+    let effect_info = effect_info_for_call_flavor(CallFlavor::Plain);
+    let descr_operand = Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
+        effect_info,
+        arg_kinds: vec![Kind::Int, Kind::Ref],
+        result_kind: Some(Kind::Ref),
+    }));
+    Insn::op_with_result(
+        "residual_call_ir_r",
+        vec![
+            Operand::ConstInt(fn_idx as i64),
+            Operand::ListOfKind(ListOfKind::new(Kind::Int, vec![Operand::ConstInt(int_val)])),
+            Operand::ListOfKind(ListOfKind::new(
+                Kind::Ref,
+                vec![Operand::Register(Register::new(Kind::Ref, ref_reg))],
+            )),
+            descr_operand,
+        ],
+        Register::new(Kind::Ref, dst_reg),
+    )
+}
+
 /// Construct the BuildList-family `residual_call_ir_r` Insn from
 /// raw register indices.  Production codewriter callsite (Slice
 /// #48.13 factor refactor) replaces the prior `emit_residual_call(

@@ -3653,6 +3653,8 @@ struct FnPtrIndices {
     store_subscr_fn: HelperHandle,
     build_list_fn: HelperHandle,
     build_tuple_fn: HelperHandle,
+    unpack_sequence_fn: HelperHandle,
+    unpack_item_fn: HelperHandle,
     build_slice_fn: HelperHandle,
     normalize_raise_varargs_fn: HelperHandle,
     call_fn_0: HelperHandle,
@@ -3831,6 +3833,11 @@ fn register_helper_fn_pointers(
     // `bh_build_list_fn` (allocation can `MemoryError`, no virtual-force).
     // Bound after the existing fn_ptrs to preserve their indices.
     let build_tuple_fn = bind(assembler, cpu.build_tuple_fn as *const (), CallFlavor::Plain);
+    // `bh_unpack_sequence_fn` validates the length and allocates the item
+    // tuple (can raise ValueError/TypeError); `bh_unpack_item_fn` indexes
+    // that validated tuple. Both can raise → `CallFlavor::Plain`.
+    let unpack_sequence_fn = bind(assembler, cpu.unpack_sequence_fn as *const (), CallFlavor::Plain);
+    let unpack_item_fn = bind(assembler, cpu.unpack_item_fn as *const (), CallFlavor::Plain);
     FnPtrIndices {
         call_fn,
         load_global_fn,
@@ -3842,6 +3849,8 @@ fn register_helper_fn_pointers(
         store_subscr_fn,
         build_list_fn,
         build_tuple_fn,
+        unpack_sequence_fn,
+        unpack_item_fn,
         build_slice_fn,
         normalize_raise_varargs_fn,
         call_fn_0,
@@ -4586,6 +4595,16 @@ impl CodeWriter {
                 HelperHandle {
                     idx: build_tuple_fn_idx,
                     flavor: _build_tuple_fn_flavor,
+                },
+            unpack_sequence_fn:
+                HelperHandle {
+                    idx: unpack_sequence_fn_idx,
+                    flavor: _unpack_sequence_fn_flavor,
+                },
+            unpack_item_fn:
+                HelperHandle {
+                    idx: unpack_item_fn_idx,
+                    flavor: _unpack_item_fn_flavor,
                 },
             build_slice_fn:
                 HelperHandle {
@@ -8501,14 +8520,44 @@ impl CodeWriter {
                         // underflow.
                         Instruction::UnpackSequence { count } => {
                             let n = count.get(op_arg) as usize;
-                            // Pop iterable, push n unpacked items.
-                            // pypy/interpreter/pyopcode.py:872.
-                            pop_and_decr_depth(&mut current_state, &mut current_depth);
-                            for _ in 0..n {
-                                push_fresh_ref(&mut current_state, &mut graph);
-                                current_depth += 1;
+                            // Pop the sequence; preserve it in a stable scratch reg
+                            // because the item pushes below reuse the stack slots.
+                            let seq_reg = emit_popvalue_ref!(current_depth, py_pc);
+                            let _seq_value = pop_ref_or_fresh(&mut current_state, &mut graph);
+                            let seq_scratch = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            emit_ref_copy(&current_block, seq_scratch, seq_reg);
+                            // unpack_sequence_fn(n, seq) → tuple of exactly n items;
+                            // raises ValueError/TypeError on length mismatch or a
+                            // non-sequence, matching opcode_unpack_sequence.
+                            let tuple_scratch = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
+                            push_walker_emit(
+                                &current_block,
+                                super::flatten::build_one_int_one_ref_fn_residual_call_ir_r_insn(
+                                    unpack_sequence_fn_idx,
+                                    n as i64,
+                                    seq_scratch,
+                                    tuple_scratch,
+                                ),
+                            );
+                            // Push the items in reverse so the stack top is item[0]
+                            // (opcode_unpack_sequence pushes `items.into_iter().rev()`).
+                            for k in (0..n).rev() {
+                                let item_dst = stack_base + current_depth;
+                                push_walker_emit(
+                                    &current_block,
+                                    super::flatten::build_one_int_one_ref_fn_residual_call_ir_r_insn(
+                                        unpack_item_fn_idx,
+                                        k as i64,
+                                        tuple_scratch,
+                                        item_dst,
+                                    ),
+                                );
+                                let item_value = fresh_ref_value(&mut graph);
+                                if let super::flow::FlowValue::Variable(v) = &item_value {
+                                    pin!(Some(*v), item_dst);
+                                }
+                                push_and_bump!(item_value, py_pc);
                             }
-                            emit_abort_permanent!();
                         }
 
                         // CPython 3.13 iterator protocol — emit abort_permanent
