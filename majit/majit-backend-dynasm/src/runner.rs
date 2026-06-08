@@ -2262,12 +2262,6 @@ impl Backend for DynasmBackend {
                     Some(slot) => {
                         let val =
                             unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 };
-                        if crate::majit_log_enabled() && i < 10 {
-                            eprintln!(
-                                "[dynasm] fail_arg[{}]: slot={} val={:#018x}",
-                                i, slot, val as u64
-                            );
-                        }
                         raw_values.push(val);
                     }
                     None => raw_values.push(0),

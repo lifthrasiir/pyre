@@ -1361,13 +1361,21 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64 ; cmp Rq(r.value), [rbp + f.ebp_loc.value]);
             }
             (Loc::Reg(r), Loc::Immed(i)) => {
-                dynasm!(self.mc ; .arch x64 ; cmp Rq(r.value), i.value as i32);
+                self.emit_cmp_imm64(r.value, i.value);
             }
             (Loc::Frame(f), Loc::Reg(s)) => {
                 dynasm!(self.mc ; .arch x64 ; cmp [rbp + f.ebp_loc.value], Rq(s.value));
             }
             (Loc::Frame(f), Loc::Immed(i)) => {
-                dynasm!(self.mc ; .arch x64 ; cmp QWORD [rbp + f.ebp_loc.value], i.value as i32);
+                if let Ok(v) = i32::try_from(i.value) {
+                    dynasm!(self.mc ; .arch x64 ; cmp QWORD [rbp + f.ebp_loc.value], v);
+                } else {
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), QWORD i.value
+                        ; cmp QWORD [rbp + f.ebp_loc.value], Rq(scratch)
+                    );
+                }
             }
             _ => {
                 self.regalloc_mov(loc0, &Loc::Reg(crate::regloc::X86_64_SCRATCH_REG));
