@@ -662,6 +662,42 @@ impl BlackholeInterpreter {
         self.jitcode.get_live_vars_info(self.position, self.op_live)
     }
 
+    /// Result register of the call this frame is resuming after.
+    ///
+    /// `_setup_return_value_*` connects a returning callee's value to the
+    /// caller's `xxx_call_yyy` result register, read as `code[position-1]`
+    /// (the byte right before the resume position).  The portal codewriter
+    /// emits a per-push valuestackdepth sync (`setfield_vable_i` of the
+    /// valuestackdepth field) immediately after a call result push, so in
+    /// portal jitcode that 5-byte sync lands between the call's result
+    /// register byte and the next opcode's `-live-` resume anchor that
+    /// `position` points at.  When such a sync precedes the anchor, step
+    /// back over it to reach the result register; otherwise `position-1`
+    /// holds it directly.
+    fn call_result_reg(&self) -> usize {
+        // setfield_vable_i: op + struct_reg + value_reg + descr(2 bytes).
+        const VSD_SYNC_LEN: usize = 5;
+        // valuestackdepth static-field index (codewriter
+        // VABLE_VALUESTACKDEPTH_FIELD_IDX).
+        const VSD_FIELD_IDX: usize = 2;
+        let code = &self.jitcode.code;
+        let pos = self.position;
+        if pos > VSD_SYNC_LEN
+            && code[pos - VSD_SYNC_LEN] == majit_translate::insns::BC_SETFIELD_VABLE_I
+        {
+            if let Some(descr_idx) = self.peek_u16_at(pos - 2) {
+                if let Some(BhDescr::VableField { index }) =
+                    self.runtime_bh_descr(descr_idx as usize)
+                {
+                    if *index == VSD_FIELD_IDX {
+                        return code[pos - VSD_SYNC_LEN - 1] as usize;
+                    }
+                }
+            }
+        }
+        code[pos - 1] as usize
+    }
+
     /// blackhole.py:1653 _setup_return_value_i
     ///
     /// Connect the return of values from the called frame to the
@@ -669,21 +705,21 @@ impl BlackholeInterpreter {
     /// blackhole.py:1653 _setup_return_value_i
     pub fn setup_return_value_i(&mut self, result: i64) {
         // blackhole.py:1655-1656
-        let reg_idx = self.jitcode.code[self.position - 1] as usize;
+        let reg_idx = self.call_result_reg();
         self.registers_i[reg_idx] = result;
     }
 
     /// blackhole.py:1657 _setup_return_value_r
     pub fn setup_return_value_r(&mut self, result: i64) {
         // blackhole.py:1658-1659
-        let reg_idx = self.jitcode.code[self.position - 1] as usize;
+        let reg_idx = self.call_result_reg();
         self.registers_r[reg_idx] = result;
     }
 
     /// blackhole.py:1660 _setup_return_value_f
     pub fn setup_return_value_f(&mut self, result: i64) {
         // blackhole.py:1661-1662
-        let reg_idx = self.jitcode.code[self.position - 1] as usize;
+        let reg_idx = self.call_result_reg();
         self.registers_f[reg_idx] = result;
     }
 
