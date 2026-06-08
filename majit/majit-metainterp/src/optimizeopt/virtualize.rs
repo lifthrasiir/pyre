@@ -757,12 +757,8 @@ impl OptVirtualize {
                         })
                         .and_then(|widx| get_field(&vinfo.fields, widx));
                     if let Some(val_ref) = stored {
-                        let b_old = ctx
-                            .ensure_box(op.pos.get())
-                            .expect("body-namespace OpRef must have a BoxRef slot");
-                        let b_val = ctx
-                            .ensure_box(val_ref)
-                            .expect("body-namespace OpRef must have a BoxRef slot");
+                        let b_old = BoxRef::from_bound_op(op_rc);
+                        let b_val = ctx.get_box_replacement(val_ref);
                         ctx.make_equal_to(&b_old, &b_val);
                         return OptimizationResult::Remove;
                     }
